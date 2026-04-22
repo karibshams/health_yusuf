@@ -1,10 +1,12 @@
 """
 HealthRide AI — Part 2a: Live Map & Real-Time Dispatch
-Driver scoring, matching, auto-assign, smart routing, and live monitoring.
+Driver scoring, matching, auto-assign, smart routing,
+live monitoring, ETA polling, and manual override sync.
 """
 
 import math
-from typing import Optional
+import threading
+from typing import Optional, Callable
 from datetime import datetime
 
 from config import Config
@@ -49,10 +51,10 @@ class DriverScorer:
     Scores a driver against a trip (0.0 – 1.0).
 
     Weights:
-      Proximity     40%  — closer is better
-      Availability  25%  — available > en_route > on_break
-      Vehicle match 20%  — exact match or compatible upgrade
-      Performance   15%  — rating out of 5.0
+      Proximity     40%
+      Availability  25%
+      Vehicle match 20%
+      Performance   15%
     """
 
     WEIGHTS = {"proximity": 0.40, "availability": 0.25, "vehicle": 0.20, "performance": 0.15}
@@ -105,7 +107,7 @@ class DriverScorer:
 # ─────────────────────────────────────────
 
 class DriverMatcher:
-    """Finds and ranks drivers for a trip. Powers the 88% Match UI display."""
+    """Finds and ranks drivers for a trip. Powers the 88% Match UI card."""
 
     def __init__(self, scorer: DriverScorer):
         self.scorer = scorer
@@ -145,7 +147,7 @@ class AutoAssigner:
         self.matcher = matcher
 
     def assign_single(self, trip: Trip, drivers: list[Driver]) -> Optional[dict]:
-        """Returns AI recommendation dict for one trip — powers the 'Accept AI Recommendation' button."""
+        """Powers the 'Accept AI Recommendation' button — single trip."""
         result = self.matcher.find_best(trip, drivers)
         if not result:
             return None
@@ -159,17 +161,13 @@ class AutoAssigner:
         }
 
     def bulk_assign(self, trips: list[Trip], drivers: list[Driver]) -> list[dict]:
-        """
-        Bulk AI Auto-Assign — sorts by appointment time first (non-negotiable).
-        Powers the 'AI Auto-Assign' button on Live Map.
-        """
+        """Powers the 'AI Auto-Assign' button — all unassigned trips at once."""
         unassigned = sorted(
             [t for t in trips if t.status == TripStatus.UNASSIGNED],
             key=lambda t: t.appointment_time or t.pickup_time
         )
         driver_pool = list(drivers)
         assignments = []
-
         for trip in unassigned:
             result = self.matcher.find_best(trip, driver_pool)
             if result:
@@ -179,8 +177,7 @@ class AutoAssigner:
                     "driver_name":  result["driver"].name,
                     "confidence":   result["confidence"],
                 })
-                result["driver"].status = DriverStatus.EN_ROUTE  # prevent double-booking
-
+                result["driver"].status = DriverStatus.EN_ROUTE
         return assignments
 
 
@@ -191,7 +188,7 @@ class AutoAssigner:
 class SmartRouter:
     """
     Wraps Google Maps routing.
-    Backend dev injects googlemaps.Client(key=Config.GOOGLE_MAPS_API_KEY).
+    Backend dev injects: googlemaps.Client(key=Config.GOOGLE_MAPS_API_KEY)
     Falls back to straight-line estimate if no client provided.
     """
 
@@ -201,18 +198,16 @@ class SmartRouter:
     def get_route(self, origin: tuple, destination: tuple, departure_time: datetime) -> dict:
         if self.maps_client:
             return self.maps_client.directions(
-                origin=origin,
-                destination=destination,
-                mode="driving",
-                departure_time=departure_time,
+                origin=origin, destination=destination,
+                mode="driving", departure_time=departure_time,
                 traffic_model="best_guess"
             )
         dist = GeoUtils.distance_km(origin[0], origin[1], destination[0], destination[1])
         return {
-            "distance_km":      round(dist, 2),
-            "duration_min":     round(GeoUtils.eta_minutes(dist)),
-            "traffic_delay_min":0,
-            "source":           "fallback_estimate"
+            "distance_km":       round(dist, 2),
+            "duration_min":      round(GeoUtils.eta_minutes(dist)),
+            "traffic_delay_min": 0,
+            "source":            "fallback_estimate"
         }
 
     def recalculate_eta(self, driver_location: tuple, destination: tuple) -> int:
@@ -224,14 +219,76 @@ class SmartRouter:
 
 
 # ─────────────────────────────────────────
+# ETA Polling Handler
+# ─────────────────────────────────────────
+
+class ETAPollingHandler:
+    """
+    Background thread — polls active trips and recalculates driver ETAs.
+    Only fires callback when ETA shifts by 3+ minutes (no noise).
+    Backend dev provides on_eta_update callback → push via Django Channels.
+    """
+
+    ETA_CHANGE_THRESHOLD_MIN = 3
+
+    def __init__(
+        self,
+        smart_router:   SmartRouter,
+        on_eta_update:  Callable[[str, int], None],
+        interval_sec:   int = 30
+    ):
+        self.smart_router   = smart_router
+        self.on_eta_update  = on_eta_update
+        self.interval_sec   = interval_sec
+        self._active_trips: dict[str, dict] = {}
+        self._running       = False
+        self._thread:       Optional[threading.Thread] = None
+
+    def register_trip(self, trip_id: str, driver: Driver, destination: tuple):
+        self._active_trips[trip_id] = {
+            "driver": driver, "destination": destination, "last_eta": None
+        }
+
+    def unregister_trip(self, trip_id: str):
+        self._active_trips.pop(trip_id, None)
+
+    def start(self):
+        self._running = True
+        self._thread  = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _poll_loop(self):
+        import time
+        while self._running:
+            self._recalculate_all()
+            time.sleep(self.interval_sec)
+
+    def _recalculate_all(self):
+        for trip_id, data in list(self._active_trips.items()):
+            driver      = data["driver"]
+            destination = data["destination"]
+            last_eta    = data["last_eta"]
+            new_eta = self.smart_router.recalculate_eta(
+                (driver.location.lat, driver.location.lng), destination
+            )
+            if last_eta is None or abs(new_eta - last_eta) >= self.ETA_CHANGE_THRESHOLD_MIN:
+                data["last_eta"] = new_eta
+                self.on_eta_update(trip_id, new_eta)
+
+
+# ─────────────────────────────────────────
 # Recommendation Builder
 # ─────────────────────────────────────────
 
 class RecommendationBuilder:
     """
-    Builds plain-English AIRecommendation objects for the Provider Portal.
-    Covers all 6 triggers from requirements:
-    trip_cancelled | driver_late | no_show | last_minute_trip | vehicle_issue | traffic_delay
+    Builds plain-English AIRecommendation for all 6 monitoring triggers.
+    what_happened / what_to_change / why_it_helps → shown in Provider Portal.
     """
 
     def build(
@@ -256,16 +313,15 @@ class RecommendationBuilder:
             trigger=MonitoringTrigger.TRIP_CANCELLED,
             what_happened=f"Trip #{trip.id} at {trip.pickup_time.strftime('%I:%M %p')} was cancelled.",
             what_to_change=f"Reassign {driver.name} to the next nearby unassigned trip." if driver else "No reassignment available.",
-            why_it_helps=f"{driver.name} is now free and {ctx.get('distance_km','?')} km from other pickups. Keeps utilization high." if driver else "",
+            why_it_helps=f"{driver.name} is now free and {ctx.get('distance_km','?')} km from other pickups." if driver else "",
             trip_id=trip.id, suggested_driver_id=driver.id if driver else None,
             confidence=ctx.get("confidence", 0.85)
         )
 
     def _driver_late(self, trip, driver, ctx) -> AIRecommendation:
-        delay = ctx.get("delay_minutes", 0)
         return AIRecommendation(
             trigger=MonitoringTrigger.DRIVER_LATE,
-            what_happened=f"Driver is running {delay} min late for trip #{trip.id}.",
+            what_happened=f"Driver is running {ctx.get('delay_minutes', 0)} min late for trip #{trip.id}.",
             what_to_change=f"Reassign trip #{trip.id} to {driver.name}." if driver else "Find nearest available driver.",
             why_it_helps=f"{driver.name} is {ctx.get('distance_km','?')} km away ({ctx.get('eta_minutes','?')} min). Prevents late arrival." if driver else "",
             trip_id=trip.id, suggested_driver_id=driver.id if driver else None,
@@ -319,48 +375,44 @@ class RecommendationBuilder:
 
 class MonitoringEngine:
     """
-    Live trigger processor. Watches for events throughout the day.
-    Supports Manual / One-Click / Automatic automation levels.
+    Live trigger processor. Supports Manual / One-Click / Automatic modes.
+    Backend dev calls process_event() whenever a trigger fires.
     """
 
     def __init__(
         self,
-        matcher:            DriverMatcher,
-        rec_builder:        RecommendationBuilder,
-        automation_level:   AutomationLevel = AutomationLevel.MANUAL
+        matcher:          DriverMatcher,
+        rec_builder:      RecommendationBuilder,
+        automation_level: AutomationLevel = AutomationLevel.MANUAL
     ):
-        self.matcher            = matcher
-        self.rec_builder        = rec_builder
-        self.automation_level   = automation_level
-        self.pending:           list[AIRecommendation] = []
+        self.matcher          = matcher
+        self.rec_builder      = rec_builder
+        self.automation_level = automation_level
+        self.pending:         list[AIRecommendation] = []
 
     def process_event(
         self,
-        trigger:        MonitoringTrigger,
-        affected_trip:  Trip,
-        drivers:        list[Driver],
-        context:        dict = {}
+        trigger:       MonitoringTrigger,
+        affected_trip: Trip,
+        drivers:       list[Driver],
+        context:       dict = {}
     ) -> AIRecommendation:
         best = self.matcher.find_best(affected_trip, drivers)
         suggested_driver = best["driver"] if best else None
         if best:
             context.update({
-                "confidence":   best["confidence"] / 100,
-                "distance_km":  best["distance_km"],
-                "eta_minutes":  best["eta_minutes"],
+                "confidence":  best["confidence"] / 100,
+                "distance_km": best["distance_km"],
+                "eta_minutes": best["eta_minutes"],
             })
-
         rec = self.rec_builder.build(trigger, affected_trip, suggested_driver, context)
-
         if self.automation_level == AutomationLevel.AUTOMATIC:
-            rec.accepted = True         # backend applies change automatically
+            rec.accepted = True
         else:
-            self.pending.append(rec)    # queue for provider review
-
+            self.pending.append(rec)
         return rec
 
     def batch_accept(self) -> list[AIRecommendation]:
-        """One-Click mode — accept all pending at once."""
         for rec in self.pending:
             rec.accepted = True
         accepted, self.pending = list(self.pending), []
@@ -376,6 +428,47 @@ class MonitoringEngine:
 
     def set_automation_level(self, level: AutomationLevel):
         self.automation_level = level
+
+
+# ─────────────────────────────────────────
+# Manual Override Handler
+# ─────────────────────────────────────────
+
+class ManualOverrideHandler:
+    """
+    Syncs AI state when dispatcher manually overrides an assignment.
+    Called on every drag-and-drop on the dispatch board.
+    """
+
+    def __init__(self, monitoring_engine: MonitoringEngine):
+        self.monitoring_engine = monitoring_engine
+        self.override_log:     list[dict] = []
+
+    def apply_override(
+        self,
+        trip:               Trip,
+        new_driver:         Driver,
+        previous_driver_id: Optional[str],
+        dispatcher_id:      str,
+        feedback:           Optional[str] = None
+    ) -> dict:
+        trip.assigned_driver_id = new_driver.id
+        trip.status             = TripStatus.SCHEDULED
+        self.monitoring_engine.dismiss(trip.id, feedback=feedback)
+
+        event = {
+            "trip_id":            trip.id,
+            "previous_driver_id": previous_driver_id,
+            "new_driver_id":      new_driver.id,
+            "overridden_by":      dispatcher_id,
+            "timestamp":          datetime.now().isoformat(),
+            "feedback":           feedback,
+        }
+        self.override_log.append(event)
+        return event
+
+    def get_override_log(self) -> list[dict]:
+        return self.override_log
 
 
 # ─────────────────────────────────────────
@@ -396,13 +489,10 @@ class DispatchNotifier:
 
     def escalation_alert(self, driver: Driver, trip: Trip) -> dict:
         return {
-            "type":      "escalation",
+            "type":    "escalation",
             "driver_id": driver.id,
-            "trip_id":   trip.id,
-            "message":   (
-                f"Driver {driver.name} has not acknowledged trip #{trip.id} "
-                f"after {Config.ACK_TIMEOUT_MIN} min."
-            )
+            "trip_id": trip.id,
+            "message": f"Driver {driver.name} has not acknowledged trip #{trip.id} after {Config.ACK_TIMEOUT_MIN} min."
         }
 
 
@@ -416,15 +506,26 @@ class LiveDispatchFactory:
     @staticmethod
     def create(
         maps_client=None,
-        automation_level: AutomationLevel = AutomationLevel.MANUAL
+        automation_level: AutomationLevel = AutomationLevel.MANUAL,
+        on_eta_update:    Optional[Callable[[str, int], None]] = None,
+        eta_interval_sec: int = 30
     ) -> dict:
         scorer      = DriverScorer()
         matcher     = DriverMatcher(scorer)
         rec_builder = RecommendationBuilder()
-        return {
-            "auto_assigner":     AutoAssigner(matcher),
-            "monitoring_engine": MonitoringEngine(matcher, rec_builder, automation_level),
-            "smart_router":      SmartRouter(maps_client),
-            "dispatch_notifier": DispatchNotifier(),
-            "driver_matcher":    matcher,
+        router      = SmartRouter(maps_client)
+        engine      = MonitoringEngine(matcher, rec_builder, automation_level)
+
+        components = {
+            "auto_assigner":      AutoAssigner(matcher),
+            "monitoring_engine":  engine,
+            "smart_router":       router,
+            "dispatch_notifier":  DispatchNotifier(),
+            "driver_matcher":     matcher,
+            "override_handler":   ManualOverrideHandler(engine),
         }
+
+        if on_eta_update:
+            components["eta_polling_handler"] = ETAPollingHandler(router, on_eta_update, eta_interval_sec)
+
+        return components
