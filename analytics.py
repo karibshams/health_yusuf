@@ -1,6 +1,6 @@
 """
 HealthRide AI — Analytics Engine
-Computes all AI performance metrics shown in the Provider Portal.
+All Provider Portal metrics including AI accuracy.
 """
 
 from collections import Counter
@@ -8,19 +8,21 @@ from dataclasses import dataclass, field
 from models import AIRecommendation, Trip, TripStatus
 
 
+# ─────────────────────────────────────────
+# Metric Data Classes
+# ─────────────────────────────────────────
+
 @dataclass
 class CallMetrics:
-    total_calls:        int = 0
-    bookings_created:   int = 0
-    escalations:        int = 0
+    total_calls:        int  = 0
+    bookings_created:   int  = 0
+    escalations:        int  = 0
     intents:            dict = field(default_factory=dict)
     escalation_reasons: list = field(default_factory=list)
 
     @property
     def conversion_rate(self) -> float:
-        if not self.total_calls:
-            return 0.0
-        return round(self.bookings_created / self.total_calls * 100, 2)
+        return round(self.bookings_created / self.total_calls * 100, 2) if self.total_calls else 0.0
 
 
 @dataclass
@@ -31,19 +33,68 @@ class DispatchMetrics:
 
     @property
     def acceptance_rate(self) -> float:
-        if not self.total_recommendations:
-            return 0.0
-        return round(self.accepted / self.total_recommendations * 100, 2)
+        return round(self.accepted / self.total_recommendations * 100, 2) if self.total_recommendations else 0.0
 
+
+@dataclass
+class AIAccuracyReport:
+    total_recommendations: int
+    accepted:              int
+    dismissed:             int
+    overridden:            int
+    accuracy_score:        float
+    avg_confidence:        float
+    top_dismiss_triggers:  list[dict]
+
+
+# ─────────────────────────────────────────
+# AI Accuracy Analyzer
+# ─────────────────────────────────────────
+
+class AIAccuracyAnalyzer:
+    """Measures how accurate and useful AI recommendations actually are."""
+
+    def analyze(
+        self,
+        recommendations: list[AIRecommendation],
+        override_log:    list[dict]
+    ) -> AIAccuracyReport:
+        accepted  = [r for r in recommendations if r.accepted is True]
+        dismissed = [r for r in recommendations if r.accepted is False]
+        decided   = len(accepted) + len(dismissed)
+
+        accuracy  = round(len(accepted) / decided * 100, 2) if decided else 0.0
+        avg_conf  = round(sum(r.confidence for r in accepted) / len(accepted) * 100, 2) if accepted else 0.0
+
+        dismiss_counts  = Counter(r.trigger.value for r in dismissed)
+        top_dismiss     = [{"trigger": t, "count": c} for t, c in dismiss_counts.most_common(3)]
+
+        return AIAccuracyReport(
+            total_recommendations = len(recommendations),
+            accepted              = len(accepted),
+            dismissed             = len(dismissed),
+            overridden            = len(override_log),
+            accuracy_score        = accuracy,
+            avg_confidence        = avg_conf,
+            top_dismiss_triggers  = top_dismiss
+        )
+
+
+# ─────────────────────────────────────────
+# Analytics Engine
+# ─────────────────────────────────────────
 
 class AnalyticsEngine:
     """
-    Aggregates raw event data into Provider Portal metrics.
-    Backend dev feeds lists of raw dicts / objects; gets metric objects back.
+    Full analytics for the Provider Portal.
+    Backend dev feeds raw data in; gets metric dicts out.
     """
 
+    def __init__(self):
+        self.accuracy_analyzer = AIAccuracyAnalyzer()
+
     def call_metrics(self, call_logs: list[dict]) -> CallMetrics:
-        metrics = CallMetrics(total_calls=len(call_logs))
+        metrics       = CallMetrics(total_calls=len(call_logs))
         intent_counts = Counter()
         for log in call_logs:
             if intent := log.get("intent"):
@@ -73,17 +124,28 @@ class AnalyticsEngine:
         on_time = sum(1 for t in completed if t.notes != "late")
         return round(on_time / len(completed) * 100, 2)
 
-    def summary(self, call_logs: list[dict], recommendations: list[AIRecommendation], trips: list[Trip]) -> dict:
-        """Single method — returns everything the Provider Portal dashboard needs."""
-        call    = self.call_metrics(call_logs)
-        dispatch= self.dispatch_metrics(recommendations)
+    def summary(
+        self,
+        call_logs:       list[dict],
+        recommendations: list[AIRecommendation],
+        trips:           list[Trip],
+        override_log:    list[dict] = []
+    ) -> dict:
+        """Single method — returns everything the Provider Portal needs."""
+        call        = self.call_metrics(call_logs)
+        dispatch    = self.dispatch_metrics(recommendations)
+        accuracy    = self.accuracy_analyzer.analyze(recommendations, override_log)
+
         return {
-            "call_volume":          call.total_calls,
-            "booking_conversion":   call.conversion_rate,
-            "top_intents":          call.intents,
-            "escalation_count":     call.escalations,
-            "escalation_reasons":   call.escalation_reasons,
-            "ai_acceptance_rate":   dispatch.acceptance_rate,
-            "recommendations_total":dispatch.total_recommendations,
-            "on_time_rate":         self.on_time_rate(trips),
+            "call_volume":              call.total_calls,
+            "booking_conversion":       call.conversion_rate,
+            "top_intents":              call.intents,
+            "escalation_count":         call.escalations,
+            "escalation_reasons":       call.escalation_reasons,
+            "ai_acceptance_rate":       dispatch.acceptance_rate,
+            "on_time_rate":             self.on_time_rate(trips),
+            "ai_accuracy_score":        accuracy.accuracy_score,
+            "ai_avg_confidence":        accuracy.avg_confidence,
+            "ai_overrides":             accuracy.overridden,
+            "top_dismissed_triggers":   accuracy.top_dismiss_triggers,
         }
