@@ -1,19 +1,59 @@
 """
 HealthRide AI — Part 2b: Daily Schedule AI
-Full-day schedule generation, optimization, conflict detection,
-capacity planning, and AI suggestions panel (Unassigned sidebar).
+Full-day schedule generation, all 3 optimization modes,
+conflict detection, capacity planning, and unassigned sidebar.
 """
 
-import math
 from typing import Optional
 from datetime import datetime, timedelta
 
 from models import (
-    Trip, Driver, AIRecommendation,
-    TripStatus, DriverStatus, VehicleType,
-    OptimizationMode, MonitoringTrigger
+    Trip, Driver,
+    TripStatus, DriverStatus, VehicleType, OptimizationMode
 )
 from live_dispatch_ai import GeoUtils, DriverMatcher, DriverScorer
+
+
+# ─────────────────────────────────────────
+# Optimization Mode Rules
+# ─────────────────────────────────────────
+
+class OptimizationModeConfig:
+    """Defines per-mode scheduling constraints."""
+
+    from dataclasses import dataclass
+
+    @dataclass
+    class ModeRules:
+        max_trips_per_driver:   int
+        break_interval_trips:   int
+        break_duration_min:     int
+        buffer_between_trips:   int
+
+    RULES = {
+        OptimizationMode.EFFICIENT: ModeRules(
+            max_trips_per_driver=10,
+            break_interval_trips=10,
+            break_duration_min=0,
+            buffer_between_trips=5,
+        ),
+        OptimizationMode.BALANCED: ModeRules(
+            max_trips_per_driver=7,
+            break_interval_trips=4,
+            break_duration_min=20,
+            buffer_between_trips=10,
+        ),
+        OptimizationMode.RELAXED: ModeRules(
+            max_trips_per_driver=5,
+            break_interval_trips=3,
+            break_duration_min=30,
+            buffer_between_trips=20,
+        ),
+    }
+
+    @classmethod
+    def get(cls, mode: OptimizationMode):
+        return cls.RULES[mode]
 
 
 # ─────────────────────────────────────────
@@ -21,12 +61,12 @@ from live_dispatch_ai import GeoUtils, DriverMatcher, DriverScorer
 # ─────────────────────────────────────────
 
 class ScheduleEntry:
-    """Represents one driver-trip assignment block on the dispatch board."""
+    """One driver-trip block on the dispatch board."""
 
     def __init__(self, trip: Trip, driver: Driver, route: dict):
         self.trip       = trip
         self.driver     = driver
-        self.route      = route             # from SmartRouter
+        self.route      = route
         self.start_time = trip.pickup_time
         self.end_time   = trip.pickup_time + timedelta(minutes=route.get("duration_min", 0))
 
@@ -48,69 +88,72 @@ class ScheduleEntry:
 
 
 # ─────────────────────────────────────────
-# Schedule Optimizer
+# Schedule Optimizer (all 3 modes)
 # ─────────────────────────────────────────
 
 class ScheduleOptimizer:
     """
-    Generates the full day's optimized schedule.
-    Two modes: Manual (dispatcher assigns) and AI-Powered.
-
-    Rules enforced:
-    - Appointment times are NON-NEGOTIABLE — always met first.
-    - Vehicle type must match requirement.
-    - No double-booking a driver.
-    - Workload distributed by OptimizationMode.
+    Generates the full optimized day schedule.
+    Supports Efficient / Balanced / Relaxed modes.
+    Appointment times are always non-negotiable.
     """
 
     def __init__(self, matcher: DriverMatcher, mode: OptimizationMode = OptimizationMode.EFFICIENT):
-        self.matcher    = matcher
-        self.mode       = mode
+        self.matcher = matcher
+        self.mode    = mode
 
     def generate(self, trips: list[Trip], drivers: list[Driver]) -> list[ScheduleEntry]:
-        """AI-Powered mode — generate full optimized schedule."""
+        rules           = OptimizationModeConfig.get(self.mode)
         sorted_trips    = self._sort_by_priority(trips)
         driver_pool     = {d.id: d for d in drivers if d.status != DriverStatus.OFFLINE}
-        schedule        = []
-        driver_schedule: dict[str, list[ScheduleEntry]] = {d: [] for d in driver_pool}
+        schedule:               list[ScheduleEntry]         = []
+        driver_schedule:        dict[str, list[ScheduleEntry]] = {d: [] for d in driver_pool}
+        driver_trip_count:      dict[str, int]              = {d: 0 for d in driver_pool}
+        driver_next_available:  dict[str, datetime]         = {d: datetime.now() for d in driver_pool}
 
         for trip in sorted_trips:
-            best_driver = self._pick_driver(trip, list(driver_pool.values()), driver_schedule)
-            if best_driver:
-                route = self._estimate_route(best_driver, trip)
-                entry = ScheduleEntry(trip, best_driver, route)
+            best = self._pick_driver(
+                trip, list(driver_pool.values()),
+                driver_schedule, driver_trip_count,
+                driver_next_available, rules
+            )
+            if best:
+                route = self._estimate_route(best, trip)
+                entry = ScheduleEntry(trip, best, route)
                 schedule.append(entry)
-                driver_schedule[best_driver.id].append(entry)
+                driver_schedule[best.id].append(entry)
+                driver_trip_count[best.id] += 1
 
-                if self.mode == OptimizationMode.EFFICIENT:
-                    best_driver.status = DriverStatus.EN_ROUTE
+                free_at = entry.end_time + timedelta(minutes=rules.buffer_between_trips)
+                if rules.break_duration_min > 0 and driver_trip_count[best.id] % rules.break_interval_trips == 0:
+                    free_at += timedelta(minutes=rules.break_duration_min)
+                driver_next_available[best.id] = free_at
             else:
-                # Trip stays unassigned — surfaces in sidebar
                 trip.status = TripStatus.UNASSIGNED
 
         return schedule
 
     def _sort_by_priority(self, trips: list[Trip]) -> list[Trip]:
-        """Appointment-bound trips always first, then by pickup time."""
-        return sorted(
-            trips,
-            key=lambda t: (
-                0 if t.appointment_time else 1,
-                t.appointment_time or t.pickup_time
-            )
-        )
+        return sorted(trips, key=lambda t: (
+            0 if t.appointment_time else 1,
+            t.appointment_time or t.pickup_time
+        ))
 
     def _pick_driver(
         self,
-        trip:            Trip,
-        drivers:         list[Driver],
-        driver_schedule: dict[str, list[ScheduleEntry]]
+        trip:                   Trip,
+        drivers:                list[Driver],
+        driver_schedule:        dict[str, list[ScheduleEntry]],
+        driver_trip_count:      dict[str, int],
+        driver_next_available:  dict[str, datetime],
+        rules
     ) -> Optional[Driver]:
-        """Pick best driver that is available and has no scheduling conflict."""
         eligible = [
             d for d in drivers
             if d.vehicle_type == trip.vehicle_type
             and d.status == DriverStatus.AVAILABLE
+            and driver_trip_count.get(d.id, 0) < rules.max_trips_per_driver
+            and driver_next_available.get(d.id, datetime.now()) <= trip.pickup_time
             and not self._has_conflict(d, trip, driver_schedule)
         ]
         if not eligible:
@@ -120,13 +163,7 @@ class ScheduleOptimizer:
             trip.pickup.lat, trip.pickup.lng
         ))
 
-    def _has_conflict(
-        self,
-        driver:          Driver,
-        trip:            Trip,
-        driver_schedule: dict[str, list[ScheduleEntry]]
-    ) -> bool:
-        """Returns True if driver already has a trip overlapping this time window."""
+    def _has_conflict(self, driver: Driver, trip: Trip, driver_schedule: dict) -> bool:
         for entry in driver_schedule.get(driver.id, []):
             if entry.start_time <= trip.pickup_time <= entry.end_time:
                 return True
@@ -137,10 +174,7 @@ class ScheduleOptimizer:
             driver.location.lat, driver.location.lng,
             trip.pickup.lat, trip.pickup.lng
         )
-        return {
-            "distance_km":  round(dist, 2),
-            "duration_min": round(GeoUtils.eta_minutes(dist)),
-        }
+        return {"distance_km": round(dist, 2), "duration_min": round(GeoUtils.eta_minutes(dist))}
 
 
 # ─────────────────────────────────────────
@@ -157,16 +191,15 @@ class ConflictDetector:
 
         conflicts = []
         for driver_id, entries in driver_entries.items():
-            entries_sorted = sorted(entries, key=lambda e: e.start_time)
-            for i in range(len(entries_sorted) - 1):
-                if entries_sorted[i].end_time > entries_sorted[i + 1].start_time:
+            entries = sorted(entries, key=lambda e: e.start_time)
+            for i in range(len(entries) - 1):
+                if entries[i].end_time > entries[i + 1].start_time:
                     conflicts.append({
-                        "driver_id":    driver_id,
-                        "trip_a":       entries_sorted[i].trip.id,
-                        "trip_b":       entries_sorted[i + 1].trip.id,
-                        "overlap_min":  round(
-                            (entries_sorted[i].end_time - entries_sorted[i + 1].start_time)
-                            .total_seconds() / 60
+                        "driver_id": driver_id,
+                        "trip_a":    entries[i].trip.id,
+                        "trip_b":    entries[i + 1].trip.id,
+                        "overlap_min": round(
+                            (entries[i].end_time - entries[i + 1].start_time).total_seconds() / 60
                         )
                     })
         return conflicts
@@ -177,24 +210,21 @@ class ConflictDetector:
 # ─────────────────────────────────────────
 
 class CapacityPlanner:
-    """
-    Workload overview across the fleet.
-    Powers the driver load bar on the dispatch board.
-    """
+    """Workload overview, overbooking alerts, and load balancing suggestions."""
 
-    OVERLOAD_THRESHOLD = 8      # trips per driver per day
+    OVERLOAD_THRESHOLD = 8
 
     def workload_summary(self, drivers: list[Driver], trips: list[Trip]) -> list[dict]:
         summary = []
         for driver in drivers:
-            assigned_trips = [t for t in trips if t.assigned_driver_id == driver.id]
+            assigned = [t for t in trips if t.assigned_driver_id == driver.id]
             summary.append({
-                "driver_id":    driver.id,
-                "driver_name":  driver.name,
-                "trip_count":   len(assigned_trips),
-                "overloaded":   len(assigned_trips) >= self.OVERLOAD_THRESHOLD,
-                "status":       driver.status.value,
-                "utilization":  round(len(assigned_trips) / self.OVERLOAD_THRESHOLD * 100),
+                "driver_id":   driver.id,
+                "driver_name": driver.name,
+                "trip_count":  len(assigned),
+                "overloaded":  len(assigned) >= self.OVERLOAD_THRESHOLD,
+                "status":      driver.status.value,
+                "utilization": round(len(assigned) / self.OVERLOAD_THRESHOLD * 100),
             })
         return summary
 
@@ -202,51 +232,48 @@ class CapacityPlanner:
         return [s for s in summary if s["overloaded"]]
 
     def balance_load(self, summary: list[dict]) -> list[dict]:
-        """Returns load-balancing suggestions when workload is uneven."""
-        avg = sum(s["trip_count"] for s in summary) / max(len(summary), 1)
-        suggestions = []
+        avg         = sum(s["trip_count"] for s in summary) / max(len(summary), 1)
         overloaded  = [s for s in summary if s["trip_count"] > avg * 1.3]
         underloaded = [s for s in summary if s["trip_count"] < avg * 0.7]
+        suggestions = []
         for over in overloaded:
             for under in underloaded:
                 suggestions.append({
-                    "move_trip_from":   over["driver_id"],
-                    "move_trip_to":     under["driver_id"],
-                    "reason":           f"{over['driver_name']} has {over['trip_count']} trips vs {under['driver_name']}'s {under['trip_count']}."
+                    "move_trip_from": over["driver_id"],
+                    "move_trip_to":   under["driver_id"],
+                    "reason": f"{over['driver_name']} has {over['trip_count']} trips vs {under['driver_name']}'s {under['trip_count']}."
                 })
         return suggestions
 
 
 # ─────────────────────────────────────────
-# Unassigned Sidebar AI (Daily Schedule Panel)
+# Unassigned Sidebar AI
 # ─────────────────────────────────────────
 
 class UnassignedSidebarAI:
     """
-    Powers the 'Unassigned' sidebar panel shown in the Daily Schedule UI.
-    For each unassigned trip, returns the AI suggested driver with confidence %.
-    Matches the UI: trip card → AI Recommendation → 'Accept AI Recommendation' button.
+    Powers the Unassigned sidebar panel on Daily Schedule.
+    Returns AI suggestion cards for each unassigned trip.
     """
 
     def __init__(self, matcher: DriverMatcher):
         self.matcher = matcher
 
     def get_suggestions(self, unassigned_trips: list[Trip], drivers: list[Driver]) -> list[dict]:
-        """Returns AI suggestion card data for every unassigned trip."""
         suggestions = []
         for trip in unassigned_trips:
             result = self.matcher.find_best(trip, drivers)
             suggestions.append({
-                "trip_id":              trip.id,
-                "passenger_name":       trip.passenger.name,
-                "vehicle_type":         trip.vehicle_type.value,
-                "pickup_time":          trip.pickup_time.strftime("%I:%M %p"),
-                "pickup_address":       trip.pickup.address,
-                "dropoff_address":      trip.dropoff.address,
-                "ai_suggested_driver":  result["driver"].name if result else None,
-                "ai_suggested_driver_id": result["driver"].id if result else None,
-                "confidence":           result["confidence"] if result else 0,
-                "eta_minutes":          result["eta_minutes"] if result else None,
+                "trip_id":                  trip.id,
+                "passenger_name":           trip.passenger.name,
+                "vehicle_type":             trip.vehicle_type.value,
+                "pickup_time":              trip.pickup_time.strftime("%I:%M %p"),
+                "pickup_address":           trip.pickup.address,
+                "dropoff_address":          trip.dropoff.address,
+                "ai_suggested_driver":      result["driver"].name if result else None,
+                "ai_suggested_driver_id":   result["driver"].id if result else None,
+                "confidence":               result["confidence"] if result else 0,
+                "eta_minutes":              result["eta_minutes"] if result else None,
             })
         return suggestions
 
@@ -256,18 +283,15 @@ class UnassignedSidebarAI:
 # ─────────────────────────────────────────
 
 class DailyStatsSummary:
-    """
-    Computes the top stat cards shown on the Daily Schedule page:
-    Total Trips | Completed | In Progress | Scheduled | Unassigned
-    """
+    """Stat cards: Total / Completed / In Progress / Scheduled / Unassigned."""
 
     def compute(self, trips: list[Trip]) -> dict:
         return {
-            "total":        len(trips),
-            "completed":    sum(1 for t in trips if t.status == TripStatus.COMPLETED),
-            "in_progress":  sum(1 for t in trips if t.status == TripStatus.IN_PROGRESS),
-            "scheduled":    sum(1 for t in trips if t.status == TripStatus.SCHEDULED),
-            "unassigned":   sum(1 for t in trips if t.status == TripStatus.UNASSIGNED),
+            "total":       len(trips),
+            "completed":   sum(1 for t in trips if t.status == TripStatus.COMPLETED),
+            "in_progress": sum(1 for t in trips if t.status == TripStatus.IN_PROGRESS),
+            "scheduled":   sum(1 for t in trips if t.status == TripStatus.SCHEDULED),
+            "unassigned":  sum(1 for t in trips if t.status == TripStatus.UNASSIGNED),
         }
 
 
@@ -283,9 +307,9 @@ class DailyScheduleFactory:
         scorer  = DriverScorer()
         matcher = DriverMatcher(scorer)
         return {
-            "schedule_optimizer":   ScheduleOptimizer(matcher, mode),
-            "conflict_detector":    ConflictDetector(),
-            "capacity_planner":     CapacityPlanner(),
-            "unassigned_sidebar":   UnassignedSidebarAI(matcher),
-            "daily_stats":          DailyStatsSummary(),
+            "schedule_optimizer": ScheduleOptimizer(matcher, mode),
+            "conflict_detector":  ConflictDetector(),
+            "capacity_planner":   CapacityPlanner(),
+            "unassigned_sidebar": UnassignedSidebarAI(matcher),
+            "daily_stats":        DailyStatsSummary(),
         }
